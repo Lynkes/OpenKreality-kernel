@@ -193,7 +193,7 @@ static int panel_probe(struct platform_device *pdev)
 			return ret;
 		}
 	} else {
-		dev_warn(&pdev->dev, "invalid gpio vdd_en: %d\n", panel->vdd_en_gpio);
+		dev_info(&pdev->dev, "no vdd_en gpio (%d), panel supply not switched\n", panel->vdd_en_gpio);
 	}
 
 	panel->rst_gpio = of_get_named_gpio(np, "ingenic,rst-gpio", 0);

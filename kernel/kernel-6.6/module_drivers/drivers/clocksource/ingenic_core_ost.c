@@ -428,7 +428,7 @@ static void percpu_timerevent_init(struct core_ost_chip *core_ost, int cpu_num)
 	*this_cpu_ptr(core_ost->percpu_timerevent) = timerevent;
 
 	enable_percpu_irq(core_ost->irq, IRQ_TYPE_NONE);
-	printk("clockevents_config_and_register success.\n");
+	pr_info("clockevents_config_and_register success.\n");
 }
 void ingenic_percpu_timerevent_init(unsigned int cpu_num)
 {

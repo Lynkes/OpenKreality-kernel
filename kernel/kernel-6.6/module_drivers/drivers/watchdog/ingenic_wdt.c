@@ -328,7 +328,7 @@ static int ingenic_wdt_probe(struct platform_device *pdev)
 #endif
 	platform_set_drvdata(pdev, drvdata);
 
-	printk("ingenic watchdog probe success\n");
+	pr_info("ingenic watchdog probe success\n");
 	return 0;
 #if IRQ_SWITCH
 err_free_irq:

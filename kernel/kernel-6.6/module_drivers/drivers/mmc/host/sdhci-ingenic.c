@@ -455,7 +455,7 @@ int ingenic_mmc_manual_detect(int index, int on)
 	host = sdhci_ing->host;
 
 	if (on) {
-		dev_err(&sdhci_ing->pdev->dev, "card insert manually\n");
+		dev_info(&sdhci_ing->pdev->dev, "card insert manually\n");
 		set_bit(INGENIC_MMC_CARD_PRESENT, &sdhci_ing->flags);
 		/* OpenKE (2026-07-22, FIRMWARE.md sec 46): mmc_add_host()'s own
 		 * mmc_start_host() ALREADY did one automatic mmc_power_up()+rescan for

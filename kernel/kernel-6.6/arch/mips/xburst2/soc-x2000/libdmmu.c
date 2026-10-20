@@ -1009,7 +1009,7 @@ int __init dmmu_init(void)
 	for (pte_index = 0; pte_index < PTRS_PER_PTE; pte_index++) {
 		res_pte_vaddr[pte_index] = res_page_paddr;
 	}
-	printk("%s %d PTRS_PER_PTE = %lu\n", __func__, __LINE__, PTRS_PER_PTE);
+	pr_debug("%s %d PTRS_PER_PTE = %lu\n", __func__, __LINE__, PTRS_PER_PTE);
 
 	return 0;
 }

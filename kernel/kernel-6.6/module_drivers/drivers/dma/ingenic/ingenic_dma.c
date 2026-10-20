@@ -1170,7 +1170,7 @@ static int __init ingenic_dma_probe(struct platform_device *pdev)
 	}
 
 	/* PDMA mcu interrupt*/
-	dma->irq_pdmam = platform_get_irq_byname(pdev, "pdmam");
+	dma->irq_pdmam = platform_get_irq_byname_optional(pdev, "pdmam");
 	if (dma->irq_pdmam >= 0) {
 		ret = devm_request_irq(&pdev->dev, dma->irq_pdmam, pdmam_int_handler,
 		                       0, "pdmam", dma);

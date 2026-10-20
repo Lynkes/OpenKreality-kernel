@@ -568,7 +568,7 @@ static int ingenic_rtc_probe(struct platform_device *pdev)
 		goto err_free_irq;
 	}
 
-	printk("ingenic RTC probe success \n");
+	pr_info("ingenic RTC probe success\n");
 	return 0;
 
 err_free_irq:

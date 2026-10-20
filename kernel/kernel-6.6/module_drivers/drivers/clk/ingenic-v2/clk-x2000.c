@@ -313,7 +313,7 @@ static void __init x2000_clk_init(struct device_node *np)
 	struct ingenic_clk_provider *ctx;
 	void __iomem *reg_base;
 
-	printk("x2000 Clock Power Management Unit init!\n");
+	pr_info("x2000 Clock Power Management Unit init\n");
 
 	if (np) {
 		reg_base = of_iomap(np, 0);

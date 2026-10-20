@@ -1606,7 +1606,7 @@ static void setup_scache(void)
 
 	c->scache.sets = scache_size / (c->scache.linesz * c->scache.ways);
 
-	printk("Unified secondary cache %ldkB %s, linesize %d bytes.\n",
+	pr_info("Unified secondary cache %ldkB %s, linesize %d bytes.\n",
 	       scache_size >> 10, way_string[c->scache.ways], c->scache.linesz);
 
 	c->options |= MIPS_CPU_INCLUSIVE_CACHES;

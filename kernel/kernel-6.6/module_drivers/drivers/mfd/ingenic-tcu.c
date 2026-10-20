@@ -864,7 +864,7 @@ static int ingenic_tcu_probe(struct platform_device *pdev)
 	}
 
 #if (!(defined CONFIG_SOC_X2600) && !(defined CONFIG_SOC_AD100))
-	tcu->irq_trigger = platform_get_irq(pdev, 1);
+	tcu->irq_trigger = platform_get_irq_optional(pdev, 1);
 	if (tcu->irq_trigger < 0) {
 		/* 2026-07-23 (final cleanup mission, Phase 6): downgraded from
 		 * dev_err - this is a real, base-SoC-dtsi-level omission (x2000.dtsi's

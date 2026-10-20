@@ -64,7 +64,7 @@ void __init init_ddr_size(void)
 
 	ddr_size = (1 << (col0 + row0 + ba0)) / 1024 / 1024 * dq_width_bytes;   // ddr_size in MBytes.
 
-	printk("ddr_size: %d MBytes\n", ddr_size);
+	pr_info("ddr_size: %d MBytes\n", ddr_size);
 }
 
 unsigned int __init arch_get_ddr_size(void)

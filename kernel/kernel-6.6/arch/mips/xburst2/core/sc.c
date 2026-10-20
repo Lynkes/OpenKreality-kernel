@@ -156,13 +156,13 @@ int ingenic_sc_init(void)
 {
 	struct cpuinfo_mips *c = &current_cpu_data;
 	int found = mips_sc_probe();
-	printk("=======found ...... ingenic sc cache ops ...!, found: %d\n\n", found);
+	pr_info("ingenic sc cache ops found: %d\n", found);
 	if (found) {
 		mips_sc_enable();
 		bcops = &mips_sc_ops;
 	}
 
-	printk("Unified secondary cache %ldkB %s, linesize %d bytes.\n",
+	pr_info("Unified secondary cache %ldkB %s, linesize %d bytes.\n",
 	       scache_size >> 10, way_string[c->scache.ways], c->scache.linesz);
 
 	c->options |= MIPS_CPU_INCLUSIVE_CACHES;
