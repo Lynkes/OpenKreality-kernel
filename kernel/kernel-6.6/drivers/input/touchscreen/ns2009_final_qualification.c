@@ -237,6 +237,15 @@ struct ns2009_nfq_state {
 	struct work_struct		kick_work;
 
 	struct dentry			*debugfs_dir;
+
+	/* G5 (NebulaOS Run 16): the two values userspace needs (the boot-time
+	 * mode apply and the display touch-wake watcher), also as sysfs
+	 * attributes on the i2c device, group "nebulaos_touch", so the image no
+	 * longer has to mount debugfs. Same handlers as debugfs. */
+	struct dev_ext_attribute	sysfs_mode;
+	struct dev_ext_attribute	sysfs_touch_down_count;
+	struct attribute		*sysfs_attrs[3];
+	struct attribute_group		sysfs_group;
 };
 
 /* Returned by ns2009_nfq_probe() if the initial allocation fails - a
@@ -713,6 +722,20 @@ static ssize_t ns2009_nfq_mode_read(struct file *file, char __user *ubuf,
 /* Constrained command interface: accepts EXACTLY "poll-only", "irq-assist",
  * or "reset-counters" - anything else is rejected with -EINVAL. No raw or
  * arbitrary IRQ control of any kind is exposed anywhere in this driver. */
+static int ns2009_nfq_mode_command(struct ns2009_nfq_state *nfq, char *cmd)
+{
+	cmd = strim(cmd);
+	if (!strcmp(cmd, "poll-only"))
+		return ns2009_nfq_set_mode(nfq, NS2009_NFQ_MODE_POLL_ONLY);
+	if (!strcmp(cmd, "irq-assist"))
+		return ns2009_nfq_set_mode(nfq, NS2009_NFQ_MODE_IRQ_ASSIST);
+	if (!strcmp(cmd, "reset-counters")) {
+		ns2009_nfq_reset_counters(nfq);
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static ssize_t ns2009_nfq_mode_write(struct file *file, const char __user *ubuf,
 				      size_t count, loff_t *ppos)
 {
@@ -724,19 +747,8 @@ static ssize_t ns2009_nfq_mode_write(struct file *file, const char __user *ubuf,
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;
 	buf[len] = '\0';
-	strim(buf);
 
-	if (!strcmp(buf, "poll-only")) {
-		error = ns2009_nfq_set_mode(nfq, NS2009_NFQ_MODE_POLL_ONLY);
-	} else if (!strcmp(buf, "irq-assist")) {
-		error = ns2009_nfq_set_mode(nfq, NS2009_NFQ_MODE_IRQ_ASSIST);
-	} else if (!strcmp(buf, "reset-counters")) {
-		ns2009_nfq_reset_counters(nfq);
-		error = 0;
-	} else {
-		return -EINVAL;
-	}
-
+	error = ns2009_nfq_mode_command(nfq, buf);
 	if (error)
 		return error;
 	return count;
@@ -748,6 +760,73 @@ static const struct file_operations ns2009_nfq_mode_fops = {
 	.write = ns2009_nfq_mode_write,
 	.llseek = default_llseek,
 };
+
+/* G5 sysfs mirror: .../nebulaos_touch/mode (rw) and touch_down_count (ro). */
+static ssize_t ns2009_nfq_sysfs_mode_show(struct device *dev,
+					   struct device_attribute *attr, char *buf)
+{
+	struct ns2009_nfq_state *nfq = container_of(attr, struct dev_ext_attribute, attr)->var;
+
+	return sysfs_emit(buf, "%s\n", ns2009_nfq_mode_name(nfq->mode));
+}
+
+static ssize_t ns2009_nfq_sysfs_mode_store(struct device *dev,
+					    struct device_attribute *attr,
+					    const char *ubuf, size_t count)
+{
+	struct ns2009_nfq_state *nfq = container_of(attr, struct dev_ext_attribute, attr)->var;
+	char buf[24];
+	int error;
+
+	strscpy(buf, ubuf, min(count + 1, sizeof(buf)));
+	error = ns2009_nfq_mode_command(nfq, buf);
+	if (error)
+		return error;
+	return count;
+}
+
+static ssize_t ns2009_nfq_sysfs_touch_down_count_show(struct device *dev,
+						       struct device_attribute *attr,
+						       char *buf)
+{
+	struct ns2009_nfq_state *nfq = container_of(attr, struct dev_ext_attribute, attr)->var;
+	u64 value;
+
+	mutex_lock(&nfq->lock);
+	value = nfq->touch_down_count;
+	mutex_unlock(&nfq->lock);
+	return sysfs_emit(buf, "%llu\n", value);
+}
+
+static void ns2009_nfq_sysfs_init(struct ns2009_nfq_state *nfq)
+{
+	struct dev_ext_attribute *mode = &nfq->sysfs_mode;
+	struct dev_ext_attribute *tdc = &nfq->sysfs_touch_down_count;
+
+	sysfs_attr_init(&mode->attr.attr);
+	mode->attr.attr.name = "mode";
+	mode->attr.attr.mode = 0644;
+	mode->attr.show = ns2009_nfq_sysfs_mode_show;
+	mode->attr.store = ns2009_nfq_sysfs_mode_store;
+	mode->var = nfq;
+
+	sysfs_attr_init(&tdc->attr.attr);
+	tdc->attr.attr.name = "touch_down_count";
+	tdc->attr.attr.mode = 0444;
+	tdc->attr.show = ns2009_nfq_sysfs_touch_down_count_show;
+	tdc->var = nfq;
+
+	nfq->sysfs_attrs[0] = &mode->attr.attr;
+	nfq->sysfs_attrs[1] = &tdc->attr.attr;
+	nfq->sysfs_attrs[2] = NULL;
+	nfq->sysfs_group.name = "nebulaos_touch";
+	nfq->sysfs_group.attrs = nfq->sysfs_attrs;
+
+	/* Like debugfs: a failure only loses the interface, never polling. */
+	if (devm_device_add_group(&nfq->client->dev, &nfq->sysfs_group))
+		dev_info(&nfq->client->dev,
+			 "final-qualification: no sysfs interface - polling is unaffected\n");
+}
 
 static ssize_t ns2009_nfq_persistent_mode_read(struct file *file, char __user *ubuf,
 						size_t count, loff_t *ppos)
@@ -826,6 +905,8 @@ void *ns2009_nfq_probe(struct i2c_client *client, struct input_dev *input,
 	nfq->persistent_mode = NS2009_NFQ_MODE_POLL_ONLY;
 	nfq->fallback_reason = "none";
 	INIT_WORK(&nfq->kick_work, ns2009_nfq_kick_work_fn);
+
+	ns2009_nfq_sysfs_init(nfq);
 
 	nfq->debugfs_dir = debugfs_create_dir("ns2009_final_qualification", NULL);
 	if (IS_ERR_OR_NULL(nfq->debugfs_dir)) {
