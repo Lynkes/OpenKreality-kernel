@@ -1266,6 +1266,15 @@ int ingenicfb_release_vidmem(struct ingenicfb_device *fbdev)
 	return 0;
 }
 
+/* Drop the built-in logo without drawing it (the boot picture was kept). */
+static void pan_drop_logo(void)
+{
+#ifdef CONFIG_TRUE_COLOR_LOGO
+	kfree(copyed_logo_buf);
+	copyed_logo_buf = NULL;
+#endif
+}
+
 int pan_init_logo(struct fb_info *fb)
 {
 
@@ -1504,12 +1513,21 @@ static int ingenicfb_do_probe(struct platform_device *pdev, struct lcd_panel *pa
 
 		dpu_ctrl_rdma_setup(dctrl, rdma_info);
 
-		dpu_ctrl_rdma_start(dctrl);
+		/* G96: the first frame is complete before the scanout starts:
+		 * the picture the boot firmware left on the panel if it could
+		 * be kept (dpu_ctrl_init), else the built-in logo. */
+		if (dpu_ctrl_boot_pic_fill(dctrl, fbdev->vidmem[0], fb->var.xres, fb->var.yres,
+		                           rdma_info->format, rdma_info->color) == 0) {
+			pan_drop_logo();
+		} else {
+			pan_init_logo(fbdev->fb);
+		}
 
-		pan_init_logo(fbdev->fb);
+		dpu_ctrl_rdma_start(dctrl);
 
 		dctrl->work_in_rdma = true;
 	} else {
+		dpu_ctrl_boot_pic_release(dctrl);
 		dctrl->work_in_rdma = false;
 	}
 

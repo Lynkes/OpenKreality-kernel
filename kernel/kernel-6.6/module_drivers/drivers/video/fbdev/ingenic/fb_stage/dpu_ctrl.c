@@ -23,6 +23,9 @@
 #include <asm/cacheflush.h>
 #include <linux/of_address.h>
 #include <linux/atomic.h>
+#include <linux/moduleparam.h>
+#include <linux/slab.h>
+#include <asm/sections.h>
 #ifdef CONFIG_MMU_NOTIFIER
 	#include <libdmmu.h>
 #endif
@@ -2182,12 +2185,329 @@ int dpu_ctrl_try_rdma_release(struct dpu_ctrl *dctrl)
 }
 
 /*
+ * NebulaOS G96: keep the power-on picture through the display takeover.
+ *
+ * The boot firmware (the RTOS in zero.bin) draws the power-on logo and leaves
+ * the DPU scanning it out of DDR while Linux boots. dpu_ctrl_init() below
+ * stops that scanout and the driver then shows a fresh framebuffer. To keep
+ * the picture on the panel, dpu_ctrl_boot_pic_snapshot() reads where the
+ * running scanout comes from and copies the picture before anything is
+ * stopped or allocated; ingenicfb puts the copy into the first frame.
+ *
+ * Read-only and conservative: it only runs after the LCD clocks are enabled
+ * by Linux, never writes a DPU register, reads descriptors and pixels only
+ * from whole pages of System RAM outside the kernel image (uncached, the way
+ * the DPU sees them), and accepts only an unscaled, unrotated, full-screen
+ * picture of the panel's own size in RGB565/RGB888/ARGB8888. Anything else
+ * and the driver keeps its previous behaviour (built-in logo or blank).
+ *
+ * The RTOS memory is not reserved from Linux (mem=256M@0x0, the DTS
+ * reserved-memory node is disabled), so by the time this runs the pages may
+ * have been reused. The copy is then what the panel was showing at that
+ * moment anyway, because the DPU scans the same DDR; a single-colour picture
+ * is treated as "nothing worth keeping".
+ */
+static bool keep_boot_picture = true;
+module_param(keep_boot_picture, bool, 0444);
+MODULE_PARM_DESC(keep_boot_picture,
+		 "Copy the boot firmware's picture into the first frame (default: on)");
+
+static bool boot_picture_debug;
+module_param(boot_picture_debug, bool, 0444);
+MODULE_PARM_DESC(boot_picture_debug,
+		 "Log the DPU scanout state and descriptors found at probe (default: off)");
+
+#define BOOT_PIC_MAX_STRIDE	4096U
+#define BOOT_PIC_KSEG1_LIMIT	0x20000000ULL
+
+/* Whole range is System RAM, reachable through KSEG1, not the kernel image. */
+static bool boot_pic_range_ok(u32 start, u32 size)
+{
+	u64 end = (u64)start + size;
+	u64 kstart = __pa_symbol(_text);
+	u64 kend = __pa_symbol(_end);
+	unsigned long pfn;
+
+	if (!size || end > BOOT_PIC_KSEG1_LIMIT) {
+		return false;
+	}
+	if ((u64)start < kend && kstart < end) {
+		return false;
+	}
+	for (pfn = PFN_DOWN(start); pfn <= PFN_DOWN(end - 1); pfn++) {
+		if (!page_is_ram(pfn)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool boot_pic_read_words(u32 phys, u32 *out, unsigned int n)
+{
+	void __iomem *p;
+	unsigned int i;
+
+	if ((phys & 3) || !boot_pic_range_ok(phys, n * 4)) {
+		return false;
+	}
+	p = ioremap(phys, n * 4);   /* low 512M, uncached: plain KSEG1 */
+	if (!p) {
+		return false;
+	}
+	for (i = 0; i < n; i++) {
+		out[i] = __raw_readl(p + i * 4);
+	}
+	iounmap(p);
+	return true;
+}
+
+static inline u32 boot_pic_swap_rb(u32 v)
+{
+	return (v & 0x0000ff00) | ((v & 0xff) << 16) | ((v >> 16) & 0xff);
+}
+
+static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel *panel)
+{
+	struct fb_videomode *mode = dctrl->active_video_mode;
+	unsigned int w = mode->xres, h = mode->yres;
+	u32 st, com, disp, glbc, hde, vde, site;
+	u32 desc[12];
+	u32 addr = 0, stride = 0, format = 0, color = 0, bytes, size, first = 0;
+	const char *chan = "none";
+	const char *why = NULL;
+	void __iomem *src;
+	bool uniform = true;
+	unsigned int x, y;
+	u32 *pic;
+
+	st = reg_read(dctrl, DC_ST);
+	com = reg_read(dctrl, DC_COM_CONFIG);
+	disp = reg_read(dctrl, DC_DISP_COM);
+	glbc = reg_read(dctrl, DC_TLB_GLBC);
+	hde = reg_read(dctrl, DC_TFT_HDE);
+	vde = reg_read(dctrl, DC_TFT_VDE);
+
+	if (boot_picture_debug) {
+		dev_info(dctrl->dev, "boot picture: ST=%08x COM_CONFIG=%08x DISP_COM=%08x TLB_GLBC=%08x HDE=%08x VDE=%08x RDMA_CHAIN_ADDR=%08lx RDMA_CHAIN_SITE=%08lx FRM_CFG_ADDR=%08lx FRM_CHAIN_SITE=%08lx\n",
+			 st, com, disp, glbc, hde, vde,
+			 reg_read(dctrl, DC_RDMA_CHAIN_ADDR), reg_read(dctrl, DC_RDMA_CHAIN_SITE),
+			 reg_read(dctrl, DC_FRM_CFG_ADDR), reg_read(dctrl, DC_FRM_CHAIN_SITE));
+	}
+
+	if (panel->lcd_type != LCD_TYPE_TFT || (disp & DC_DP_IF_SEL_MASK) != DC_DISP_COM_TFT) {
+		why = "display interface is not TFT";
+		goto out;
+	}
+	if ((hde & 0xfff) - ((hde >> DC_HDS_LBIT) & 0xfff) != w ||
+	    (vde & 0xfff) - ((vde >> DC_VDS_LBIT) & 0xfff) != h) {
+		why = "active area differs from the panel mode";
+		goto out;
+	}
+	if (glbc & DC_TLBE_MASK) {
+		why = "DPU TLB enabled";
+		goto out;
+	}
+
+	if ((com & DC_OUT_SEL_MASK) == DC_OUT_SEL_RDMA && (st & DC_SRD_WORKING)) {
+		chan = "rdma";
+		site = reg_read(dctrl, DC_RDMA_CHAIN_SITE);
+		if (!boot_pic_read_words(site, desc, 5)) {
+			why = "rdma descriptor not in RAM";
+			goto out;
+		}
+		if (boot_picture_debug) {
+			dev_info(dctrl->dev, "boot picture: rdma desc@%08x %08x %08x %08x %08x %08x\n",
+				 site, desc[0], desc[1], desc[2], desc[3], desc[4]);
+		}
+		addr = desc[1];
+		stride = desc[2];
+		format = (desc[3] >> 19) & 0xf;
+		color = (desc[3] >> 16) & 0x7;
+	} else if ((com & DC_OUT_SEL_MASK) == 0 && (st & DC_DIRECT_WORKING)) {
+		u32 en, layer = 4, i;
+
+		chan = "composer";
+		site = reg_read(dctrl, DC_FRM_CHAIN_SITE);
+		if (!boot_pic_read_words(site, desc, 11)) {
+			why = "frame descriptor not in RAM";
+			goto out;
+		}
+		if (boot_picture_debug) {
+			dev_info(dctrl->dev, "boot picture: frame desc@%08x size=%08x ctrl=%08x lay=%08x %08x %08x %08x en=%08x\n",
+				 site, desc[1], desc[2], desc[5], desc[6], desc[7], desc[8], desc[9]);
+		}
+		if ((desc[1] & 0xfff) != w || ((desc[1] >> 16) & 0xfff) != h) {
+			why = "frame size differs from the panel mode";
+			goto out;
+		}
+		en = desc[9];
+		for (i = 0; i < 4; i++) {
+			if (en & BIT(4 + i)) {
+				if (layer != 4) {
+					why = "more than one layer enabled";
+					goto out;
+				}
+				layer = i;
+			}
+		}
+		if (layer == 4 || (en & BIT(layer))) {
+			why = layer == 4 ? "no layer enabled" : "layer is scaled";
+			goto out;
+		}
+		site = desc[5 + layer];
+		if (!boot_pic_read_words(site, desc, 10)) {
+			why = "layer descriptor not in RAM";
+			goto out;
+		}
+		if (boot_picture_debug) {
+			dev_info(dctrl->dev, "boot picture: layer%u desc@%08x size=%08x cfg=%08x addr=%08x rot=%08x pos=%08x stride=%08x\n",
+				 layer, site, desc[0], desc[1], desc[2], desc[4], desc[6], desc[9]);
+		}
+		if ((desc[0] & 0xfff) != w || ((desc[0] >> 16) & 0xfff) != h ||
+		    (desc[4] & 0x7) || desc[6]) {
+			why = "layer is not an unrotated full-screen picture";
+			goto out;
+		}
+		addr = desc[2];
+		stride = desc[9];
+		format = (desc[1] >> 16) & 0xf;
+		color = (desc[1] >> 10) & 0x7;
+	} else {
+		why = "no scanout running";
+		goto out;
+	}
+
+	/* RDMA_CHAIN_CFG_FORMAT_* and LAYER_CFG_FORMAT_* agree on 565/888 (2/4),
+	 * LAYER_CFG_FORMAT_ARGB8888 (5) only exists for layers; the colour
+	 * order codes are the same for both (RGB 0, BGR 5). */
+	if (format == LAYER_CFG_FORMAT_RGB888 ||
+	    (format == LAYER_CFG_FORMAT_ARGB8888 && !strcmp(chan, "composer"))) {
+		bytes = 4;
+	} else if (format == LAYER_CFG_FORMAT_RGB565) {
+		bytes = 2;
+	} else {
+		why = "pixel format not supported";
+		goto out;
+	}
+	if (color != LAYER_CFG_COLOR_RGB && color != LAYER_CFG_COLOR_BGR) {
+		why = "colour order not supported";
+		goto out;
+	}
+	if (stride < w || stride > BOOT_PIC_MAX_STRIDE || (addr & (bytes - 1))) {
+		why = "bad stride or alignment";
+		goto out;
+	}
+	size = (stride * (h - 1) + w) * bytes;
+	if (!boot_pic_range_ok(addr, size)) {
+		why = "picture not in RAM";
+		goto out;
+	}
+
+	pic = kvmalloc_array(w * h, sizeof(u32), GFP_KERNEL);
+	if (!pic) {
+		why = "out of memory";
+		goto out;
+	}
+	src = ioremap(addr, size);  /* low 512M, uncached: plain KSEG1 */
+	if (!src) {
+		kvfree(pic);
+		why = "cannot map picture";
+		goto out;
+	}
+	for (y = 0; y < h; y++) {
+		void __iomem *line = src + y * stride * bytes;
+		u32 *dst = pic + y * w;
+
+		for (x = 0; x < w; x++) {
+			u32 v;
+
+			if (bytes == 4) {
+				v = __raw_readl(line + x * 4) & 0x00ffffff;
+			} else {
+				u32 p = __raw_readw(line + x * 2);
+				u32 r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+
+				v = ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) | (b << 3 | b >> 2);
+			}
+			if (color == LAYER_CFG_COLOR_BGR) {
+				v = boot_pic_swap_rb(v);
+			}
+			if (x == 0 && y == 0) {
+				first = v;
+			} else if (v != first) {
+				uniform = false;
+			}
+			dst[x] = v;
+		}
+	}
+	iounmap(src);
+
+	if (uniform) {
+		kvfree(pic);
+		why = "picture is a single colour";
+		goto out;
+	}
+
+	dctrl->boot_pic = pic;
+	dctrl->boot_pic_w = w;
+	dctrl->boot_pic_h = h;
+out:
+	if (why) {
+		dev_info(dctrl->dev, "boot picture not kept (%s: %s; ST=%08x)\n", chan, why, st);
+	} else {
+		dev_info(dctrl->dev, "boot picture kept (%s @%08x, %ux%u fmt %u colour %u stride %u)\n",
+			 chan, addr, w, h, format, color, stride);
+	}
+}
+
+void dpu_ctrl_boot_pic_release(struct dpu_ctrl *dctrl)
+{
+	kvfree(dctrl->boot_pic);
+	dctrl->boot_pic = NULL;
+}
+
+/*
+ * Copy the kept boot picture into a frame of the new framebuffer
+ * (xres*yres, packed, RDMA format 888; the RDMA format and colour codes
+ * equal the LAYER_CFG ones used here). Returns 0 when the frame now holds
+ * the picture. The copy is released either way.
+ */
+int dpu_ctrl_boot_pic_fill(struct dpu_ctrl *dctrl, void *dst,
+			   unsigned int xres, unsigned int yres,
+			   unsigned int format, unsigned int color)
+{
+	u32 *out = dst;
+	unsigned int i, n;
+	int ret = -EINVAL;
+
+	if (!dctrl->boot_pic) {
+		return -ENOENT;
+	}
+	if (dst && xres == dctrl->boot_pic_w && yres == dctrl->boot_pic_h &&
+	    format == LAYER_CFG_FORMAT_RGB888) {   /* == RDMA_CHAIN_CFG_FORMAT_888 */
+		n = xres * yres;
+		if (color == LAYER_CFG_COLOR_RGB) {
+			memcpy(out, dctrl->boot_pic, n * sizeof(u32));
+			ret = 0;
+		} else if (color == LAYER_CFG_COLOR_BGR) {
+			for (i = 0; i < n; i++) {
+				out[i] = boot_pic_swap_rb(dctrl->boot_pic[i]);
+			}
+			ret = 0;
+		}
+	}
+	dpu_ctrl_boot_pic_release(dctrl);
+	return ret;
+}
+
+/*
  *  初始化LCD相关数据结构资源. 与具体硬件的操作无关.
  *
  * */
 int dpu_ctrl_init(struct dpu_ctrl *dctrl, struct lcd_panel *panel)
 {
 	int ret = 0;
+	bool clk_on;
 
 	dev_info(dctrl->dev, "dpu_ctrl_init start!\n");
 
@@ -2236,8 +2556,14 @@ int dpu_ctrl_init(struct dpu_ctrl *dctrl, struct lcd_panel *panel)
 		ingenic_set_pixclk(dctrl, PICOS2KHZ(dctrl->active_video_mode->pixclock));
 	}
 
-	clk_prepare_enable(dctrl->clk);
-	clk_prepare_enable(dctrl->pclk);
+	clk_on = !clk_prepare_enable(dctrl->clk);
+	clk_on = !clk_prepare_enable(dctrl->pclk) && clk_on;
+
+	/* G96: before anything is stopped or allocated, and only with the
+	 * clocks known to be on. */
+	if (keep_boot_picture && clk_on) {
+		dpu_ctrl_boot_pic_snapshot(dctrl, panel);
+	}
 
 	ret = dpu_ctrl_alloc_rdma_desc(dctrl);
 	if (ret < 0) {
@@ -2294,6 +2620,7 @@ err_comp_desc:
 err_rdma_desc:
 	jzdsi_remove(dctrl->dsi);
 err_iounmap:
+	dpu_ctrl_boot_pic_release(dctrl);
 	clk_disable_unprepare(dctrl->pclk);
 	clk_disable_unprepare(dctrl->clk);
 	devm_free_irq(dctrl->dev, dctrl->irq, dctrl);
@@ -2315,6 +2642,7 @@ void dpu_ctrl_exit(struct dpu_ctrl *dctrl)
 
 	dpu_ctrl_release_rdma_desc(dctrl);
 	dpu_ctrl_release_comp_desc(dctrl);
+	dpu_ctrl_boot_pic_release(dctrl);
 
 	if (dctrl->lcd_type == LCD_TYPE_MIPI_SLCD || dctrl->lcd_type == LCD_TYPE_MIPI_TFT) {
 		jzdsi_remove(dctrl->dsi);

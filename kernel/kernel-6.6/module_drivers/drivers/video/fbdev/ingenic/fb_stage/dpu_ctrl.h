@@ -174,6 +174,13 @@ struct dpu_ctrl {
 	int blank;
 	int lcd_type;
 	struct work_struct dsi_work;
+
+	/* NebulaOS G96: copy of the picture the boot firmware (RTOS) left on
+	 * the panel, taken before the controller is re-initialised. xres*yres
+	 * pixels as 0x00RRGGBB, NULL when there is none. */
+	u32 *boot_pic;
+	unsigned int boot_pic_w;
+	unsigned int boot_pic_h;
 };
 
 int dpu_ctrl_init(struct dpu_ctrl *dctrl, struct lcd_panel *panel);
@@ -195,6 +202,11 @@ int dpu_ctrl_comp_stop(struct dpu_ctrl *dctrl, enum stop_mode mode);
 int dpu_ctrl_try_rdma_release(struct dpu_ctrl *dctrl);
 int ingenic_set_lvds_display_clk(struct dpu_ctrl *dctrl);
 void ingenic_set_pixclk(struct dpu_ctrl *dctrl, unsigned int pixclock_khz);
+
+int dpu_ctrl_boot_pic_fill(struct dpu_ctrl *dctrl, void *dst,
+			   unsigned int xres, unsigned int yres,
+			   unsigned int format, unsigned int color);
+void dpu_ctrl_boot_pic_release(struct dpu_ctrl *dctrl);
 
 void dump_lcdc_registers(struct dpu_ctrl *dctrl);
 void dump_comp_desc(struct dpu_ctrl *dctrl);
