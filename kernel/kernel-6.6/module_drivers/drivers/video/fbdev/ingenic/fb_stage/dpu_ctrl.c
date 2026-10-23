@@ -2207,15 +2207,21 @@ int dpu_ctrl_try_rdma_release(struct dpu_ctrl *dctrl)
  * moment anyway, because the DPU scans the same DDR; a single-colour picture
  * is treated as "nothing worth keeping".
  */
+/*
+ * The effective switch is this source (and the defconfig): on the KE the
+ * kernel command line comes only from the bootloader
+ * (MIPS_CMDLINE_FROM_BOOTLOADER, the bootloader is never changed) and this
+ * driver is built in, so ingenic_fb_stage.keep_boot_picture cannot be set
+ * there in practice. It stays as a harmless parameter for other boards.
+ *
+ * Every boot logs the scanout registers, the descriptors read and the
+ * verdict (at most 3 lines, "boot picture: ..."), so a normal boot log is
+ * enough to diagnose a picture that was not kept.
+ */
 static bool keep_boot_picture = true;
 module_param(keep_boot_picture, bool, 0444);
 MODULE_PARM_DESC(keep_boot_picture,
 		 "Copy the boot firmware's picture into the first frame (default: on)");
-
-static bool boot_picture_debug;
-module_param(boot_picture_debug, bool, 0444);
-MODULE_PARM_DESC(boot_picture_debug,
-		 "Log the DPU scanout state and descriptors found at probe (default: off)");
 
 #define BOOT_PIC_MAX_STRIDE	4096U
 #define BOOT_PIC_KSEG1_LIMIT	0x20000000ULL
@@ -2279,7 +2285,10 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 	bool uniform = true;
 	unsigned int x, y;
 	u32 *pic;
+	char dline[256];
+	int dlen = 0;
 
+	dline[0] = 0;
 	st = reg_read(dctrl, DC_ST);
 	com = reg_read(dctrl, DC_COM_CONFIG);
 	disp = reg_read(dctrl, DC_DISP_COM);
@@ -2287,12 +2296,10 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 	hde = reg_read(dctrl, DC_TFT_HDE);
 	vde = reg_read(dctrl, DC_TFT_VDE);
 
-	if (boot_picture_debug) {
-		dev_info(dctrl->dev, "boot picture: ST=%08x COM_CONFIG=%08x DISP_COM=%08x TLB_GLBC=%08x HDE=%08x VDE=%08x RDMA_CHAIN_ADDR=%08lx RDMA_CHAIN_SITE=%08lx FRM_CFG_ADDR=%08lx FRM_CHAIN_SITE=%08lx\n",
-			 st, com, disp, glbc, hde, vde,
-			 reg_read(dctrl, DC_RDMA_CHAIN_ADDR), reg_read(dctrl, DC_RDMA_CHAIN_SITE),
-			 reg_read(dctrl, DC_FRM_CFG_ADDR), reg_read(dctrl, DC_FRM_CHAIN_SITE));
-	}
+	dev_info(dctrl->dev, "boot picture: regs ST=%08x COM=%08x DISP=%08x TLB=%08x HDE=%08x VDE=%08x RDMA=%08lx/%08lx FRM=%08lx/%08lx\n",
+		 st, com, disp, glbc, hde, vde,
+		 reg_read(dctrl, DC_RDMA_CHAIN_ADDR), reg_read(dctrl, DC_RDMA_CHAIN_SITE),
+		 reg_read(dctrl, DC_FRM_CFG_ADDR), reg_read(dctrl, DC_FRM_CHAIN_SITE));
 
 	if (panel->lcd_type != LCD_TYPE_TFT || (disp & DC_DP_IF_SEL_MASK) != DC_DISP_COM_TFT) {
 		why = "display interface is not TFT";
@@ -2315,10 +2322,9 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 			why = "rdma descriptor not in RAM";
 			goto out;
 		}
-		if (boot_picture_debug) {
-			dev_info(dctrl->dev, "boot picture: rdma desc@%08x %08x %08x %08x %08x %08x\n",
-				 site, desc[0], desc[1], desc[2], desc[3], desc[4]);
-		}
+		dlen += scnprintf(dline + dlen, sizeof(dline) - dlen,
+				  " rdma@%08x %08x %08x %08x %08x %08x",
+				  site, desc[0], desc[1], desc[2], desc[3], desc[4]);
 		addr = desc[1];
 		stride = desc[2];
 		format = (desc[3] >> 19) & 0xf;
@@ -2332,10 +2338,9 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 			why = "frame descriptor not in RAM";
 			goto out;
 		}
-		if (boot_picture_debug) {
-			dev_info(dctrl->dev, "boot picture: frame desc@%08x size=%08x ctrl=%08x lay=%08x %08x %08x %08x en=%08x\n",
-				 site, desc[1], desc[2], desc[5], desc[6], desc[7], desc[8], desc[9]);
-		}
+		dlen += scnprintf(dline + dlen, sizeof(dline) - dlen,
+				  " frm@%08x size=%08x ctrl=%08x lay=%08x,%08x,%08x,%08x en=%08x",
+				  site, desc[1], desc[2], desc[5], desc[6], desc[7], desc[8], desc[9]);
 		if ((desc[1] & 0xfff) != w || ((desc[1] >> 16) & 0xfff) != h) {
 			why = "frame size differs from the panel mode";
 			goto out;
@@ -2359,10 +2364,9 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 			why = "layer descriptor not in RAM";
 			goto out;
 		}
-		if (boot_picture_debug) {
-			dev_info(dctrl->dev, "boot picture: layer%u desc@%08x size=%08x cfg=%08x addr=%08x rot=%08x pos=%08x stride=%08x\n",
-				 layer, site, desc[0], desc[1], desc[2], desc[4], desc[6], desc[9]);
-		}
+		dlen += scnprintf(dline + dlen, sizeof(dline) - dlen,
+				  " lay%u@%08x size=%08x cfg=%08x addr=%08x rot=%08x pos=%08x stride=%08x",
+				  layer, site, desc[0], desc[1], desc[2], desc[4], desc[6], desc[9]);
 		if ((desc[0] & 0xfff) != w || ((desc[0] >> 16) & 0xfff) != h ||
 		    (desc[4] & 0x7) || desc[6]) {
 			why = "layer is not an unrotated full-screen picture";
@@ -2452,6 +2456,9 @@ static void dpu_ctrl_boot_pic_snapshot(struct dpu_ctrl *dctrl, struct lcd_panel 
 	dctrl->boot_pic_w = w;
 	dctrl->boot_pic_h = h;
 out:
+	if (dlen) {
+		dev_info(dctrl->dev, "boot picture: desc%s\n", dline);
+	}
 	if (why) {
 		dev_info(dctrl->dev, "boot picture not kept (%s: %s; ST=%08x)\n", chan, why, st);
 	} else {
