@@ -138,18 +138,17 @@ static void pwm_clk_config(struct ingenic_pwm_chip *chip, unsigned int channel, 
 	}
 }
 
+/*
+ * NebulaOS (G108): returns the channel's live PRESCALE field value
+ * (0..15). The vendor version returned the field still shifted into its
+ * register position (e.g. 0x2000 for channel 3), which only "worked"
+ * because the result was never used; ingenic_pwm_get_state() now uses it.
+ */
 static unsigned int pwm_get_prescale(struct ingenic_pwm_chip *chip, unsigned int channel)
 {
-	int tmp = 0;
-	int prescale = 0;
-	if (channel < 8) {
-		tmp = pwm_readl(chip, PWM_CCFG0);
-		prescale = tmp & (0xf << channel * 4);
-	} else {
-		tmp = pwm_readl(chip, PWM_CCFG1);
-		prescale = tmp & (0xf << (channel - 8) * 4);
-	}
-	return prescale;
+	if (channel < 8)
+		return (pwm_readl(chip, PWM_CCFG0) >> (channel * 4)) & PRESCALE_MSK;
+	return (pwm_readl(chip, PWM_CCFG1) >> ((channel - 8) * 4)) & PRESCALE_MSK;
 }
 
 static void pwm_enable_hw(struct ingenic_pwm_chip *chip, unsigned int channel)
@@ -421,33 +420,48 @@ static inline struct ingenic_pwm_chip *to_ingenic_chip(struct pwm_chip *chip)
  * round trip is guaranteed to agree on tick<->ns conversion by
  * construction, not by two formulas that are merely believed equivalent.
  *
- * PRESCALE FINDING (see the report for the full trace): the vendor
- * driver reads back the live per-channel prescale register via
- * pwm_get_prescale() just before this is called, but that return value
- * is never fed into the divisor below - the divisor always uses the
- * compile-time PRESCALE macro (currently 2), unconditionally, regardless
- * of what pwm_get_prescale() actually read. This was already true of the
- * pristine, unmodified vendor .apply path before this patch - it is not
- * something introduced here. Reproducing that exact (arguably dead-code)
- * behavior here, rather than "correcting" it to honor a live-read
- * prescale, is deliberate: the acceptance bar for this patch is that
- * .get_state agrees with what .apply actually does today, not with what
- * a more "correct" driver would do.
+ * PRESCALE (NebulaOS G108, 2026-10-24): the vendor driver always used the
+ * compile-time PRESCALE (2, i.e. clk/4). The waveform register holds the
+ * HIGH and LOW tick counts in two 16-bit fields, so with clk/4 = 12.5 MHz
+ * (div_pwm at DEFAULT_PWM_CLK_RATE) the longest representable period was
+ * 65535 ticks = 5.2 ms (~191 Hz); longer periods silently overflowed the
+ * LOW field into the HIGH field. The KE buzzer (channel 3, GPC3) needs
+ * audio periods down to a few hundred Hz. ingenic_pwm_pick_prescale()
+ * therefore keeps PRESCALE for every period that fits at PRESCALE - so
+ * every existing consumer (the backlight on channel 0 at 20000 ns) is
+ * programmed bit-for-bit as before - and only raises the prescale for a
+ * period that would otherwise overflow. The prescale actually used is
+ * written to the channel's PWM_CCFG field, and .get_state reads that
+ * field back, so apply()->get_state() still agree by construction.
  */
-static unsigned long long ingenic_pwm_tick_ns(unsigned int clk_in)
+static unsigned long long ingenic_pwm_tick_ns(unsigned int clk_in, unsigned int prescale)
 {
-	unsigned int tmp = 1;
 	unsigned int pwm_freq;
 	unsigned long long clk_ns = 1000000000ULL;
-	int i;
 
-	for (i = 0; i < PRESCALE; i++) {
-		tmp = 2 * tmp;
-	}
-
-	pwm_freq = clk_in / tmp;
+	pwm_freq = clk_in >> prescale;
+	if (!pwm_freq)
+		return 0;
 	do_div(clk_ns, pwm_freq);
 	return clk_ns;
+}
+
+/* Smallest prescale >= PRESCALE whose tick count for period_ns fits one
+ * 16-bit waveform field (duty <= period, so the HIGH field fits too).
+ * Returns -ERANGE when no prescale can represent the period. */
+static int ingenic_pwm_pick_prescale(unsigned int clk_in, unsigned int period_ns)
+{
+	unsigned int prescale;
+	unsigned long long clk_ns;
+
+	for (prescale = PRESCALE; prescale <= PRESCALE_MSK; prescale++) {
+		clk_ns = ingenic_pwm_tick_ns(clk_in, prescale);
+		if (!clk_ns)
+			continue;
+		if (period_ns / (unsigned int)clk_ns <= 0xffff)
+			return prescale;
+	}
+	return -ERANGE;
 }
 
 static int ingenic_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
@@ -458,7 +472,7 @@ static int ingenic_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	unsigned int period = 0;
 	unsigned int duty = 0;
 	unsigned int clk_in = 0;
-	unsigned int prescale = 0;
+	int prescale = 0;
 	int i = 0;
 	int update_flag = 1;
 	int mode = 0;
@@ -481,19 +495,20 @@ static int ingenic_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 	/*select mode */
 	mode = ingenic_pwm->mode_sel[channel];
 
-	/*set prescale*/
-	pwm_clk_config(ingenic_pwm, channel, PRESCALE);
+	/*set prescale - see ingenic_pwm_tick_ns() (G108)*/
 	clk_in = clk_get_rate(ingenic_pwm->clk_pwm);
-	/* Hardware readback kept only for behavioral parity with the
-	 * pristine driver - see ingenic_pwm_tick_ns()'s comment above for
-	 * why this value is deliberately NOT used in the tick math below
-	 * (that was already true before this patch). */
-	prescale = pwm_get_prescale(ingenic_pwm, channel);
-	(void)prescale;
-	clk_ns = ingenic_pwm_tick_ns(clk_in);
+	prescale = ingenic_pwm_pick_prescale(clk_in, (unsigned int)period_ns);
+	if (prescale < 0) {
+		mutex_unlock(&ingenic_pwm->mutex);
+		return -ERANGE;
+	}
+	pwm_clk_config(ingenic_pwm, channel, prescale);
+	clk_ns = ingenic_pwm_tick_ns(clk_in, prescale);
 
 	period = (period_ns / (unsigned int)clk_ns);
-	printk("period=%d\n", period);
+	/* G108: pr_debug, not printk - the buzzer applies a new state for
+	 * every note, which flooded the kernel log/console. */
+	pr_debug("period=%d prescale=%d\n", period, prescale);
 	//pwm_set_period_hw(ingenic_pwm, channel, period);
 	duty = duty_ns / (unsigned int)clk_ns;
 
@@ -506,7 +521,7 @@ static int ingenic_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
 		pr_err("%s, pwm init level error\n", __func__);
 	}
 
-	printk("duty=%d level_init=%d low=%d\n", duty, ingenic_pwm->init_level, period - duty);
+	pr_debug("duty=%d level_init=%d low=%d\n", duty, ingenic_pwm->init_level, period - duty);
 
 	/*set waveform high_num and low_num*/
 	if (COMMON_MODE == mode) {
@@ -573,7 +588,7 @@ static int ingenic_pwm_set_polarity(struct pwm_chip *chip, struct pwm_device *pw
 	struct ingenic_pwm_chip *ingenic_pwm = to_ingenic_chip(chip);
 	int channel = pwm->hwpwm;
 
-	printk("%s: %d, polarity = %d\n", __func__, __LINE__, polarity);
+	pr_debug("%s: %d, polarity = %d\n", __func__, __LINE__, polarity);
 	if (polarity == PWM_POLARITY_NORMAL) {
 		pwm_set_init_level(ingenic_pwm, channel, PWM_INIT_HIGH);
 	} else if (polarity == PWM_POLARITY_INVERSED) {
@@ -756,7 +771,8 @@ static int ingenic_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
 	 * ingenic_pwm_config(): high_num == duty (ticks), low_num ==
 	 * period - duty (ticks), so period_ticks == high_num + low_num and
 	 * duty_ticks == high_num exactly. */
-	clk_ns = ingenic_pwm_tick_ns(clk_get_rate(ingenic_pwm->clk_pwm));
+	clk_ns = ingenic_pwm_tick_ns(clk_get_rate(ingenic_pwm->clk_pwm),
+				     pwm_get_prescale(ingenic_pwm, channel));
 
 	wcfg = pwm_readl(ingenic_pwm, PWM_WCFG + channel * 4);
 	high_num = (wcfg >> PWM_WCFG_HIGH) & 0xffff;

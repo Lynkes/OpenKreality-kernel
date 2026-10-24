@@ -932,10 +932,21 @@
 	status = "okay";
 };
 
+/* G108 (2026-10-24): GPC3 = the KE buzzer (passive piezo, PWM channel 3).
+ * Muxing it to PWM function 0 here makes channel 3 a normal kernel PWM
+ * output (/sys/class/pwm/pwmchip0/pwm3), owned by Klipper's nebulaos_beeper
+ * extra - replacing the old /dev/mem register poking (nebulabeep).
+ * This is NOT the GPC0 incident pattern (see
+ * nebulaos_backlight_final_controller.c): GPC0 carried a bootloader-set
+ * level the screen depended on; GPC3 carries nothing (stock and NebulaOS
+ * leave it unclaimed) and PWM's inactive output is low = buzzer silent.
+ * pwm1_pc (GPC1) is unchanged; GPC0 stays exclusively the backlight
+ * controller's. No other node in this board's tree claims GPC3 (the
+ * halley5_lcd panels that use it as vdd-en are not built for the KE). */
 &pwm {
 	status = "okay";
 	pinctrl-names = "default";
-	pinctrl-0 = <&pwm1_pc>;
+	pinctrl-0 = <&pwm1_pc>, <&pwm3_pc>;
 };
 
 &otg {
