@@ -62,6 +62,7 @@ CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 # CONFIG_STANDALONE is not set
 # CONFIG_PREVENT_FIRMWARE_BUILD is not set
+CONFIG_EXTRA_FIRMWARE="brcm/brcmfmac43430-sdio.bin brcm/brcmfmac43430-sdio.AP6212.txt brcm/brcmfmac43430-sdio.AP6212.bin brcm/brcmfmac43430-sdio.clm_blob regulatory.db regulatory.db.p7s"
 # CONFIG_ALLOW_DEV_COREDUMP is not set
 CONFIG_ZRAM=y
 CONFIG_ZRAM_DEF_COMP_LZ4=y
