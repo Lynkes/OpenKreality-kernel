@@ -9,6 +9,10 @@ enum slice_type_e {
 	M_SLICE_TYPE_I  = 2,
 };
 
+/* linux/minmax.h (6.6) already defines MIN/MAX; keep the vendor versions here,
+ * which this encoder code was written against. */
+#undef MAX
+#undef MIN
 #define MAX(X, Y) ((X) >= (Y) ? (X) : (Y))
 #define MIN(X, Y) ((X) <= (Y) ? (X) : (Y))
 
